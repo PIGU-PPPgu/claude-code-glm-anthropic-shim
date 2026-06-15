@@ -247,6 +247,29 @@ GLM_SHIM_THINKING=enabled
 
 shim 不会把 Anthropic 专用的 `reasoning_effort` 转发给 BigModel 的 OpenAI 兼容接口，这样可以避开一些第三方兼容层里 `reasoning_effort` 和 thinking 状态冲突导致的 400 错误。
 
+## 上游限流和重试
+
+dynamic workflow 会同时启动多个 agent，请求量会被放大。shim 默认会限制同时访问 BigModel 的上游请求数量，并对临时错误做退避重试：
+
+```text
+GLM_SHIM_MAX_CONCURRENT=3
+GLM_SHIM_MAX_RETRIES=5
+GLM_SHIM_RETRY_BASE_MS=2000
+GLM_SHIM_UPSTREAM_TIMEOUT_MS=300000
+```
+
+会重试的上游状态码：
+
+```text
+429, 500, 502, 503, 504
+```
+
+如果你看到 `该模型当前访问量过大`、`账户已达到速率限制` 或 `网络错误，请稍后重试`，优先降低并发，例如：
+
+```bash
+GLM_SHIM_MAX_CONCURRENT=2 ./run.sh
+```
+
 ## 日志
 
 默认只记录脱敏后的请求摘要。只有排查问题时才建议打开完整 body 日志：

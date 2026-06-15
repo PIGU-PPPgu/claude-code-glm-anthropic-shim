@@ -141,6 +141,30 @@ The shim intentionally does not forward Anthropic-only `reasoning_effort` to
 BigModel's OpenAI-compatible endpoint. This avoids the class of third-party
 errors where `reasoning_effort` conflicts with a disabled thinking option.
 
+## Upstream rate limits and retries
+
+Dynamic workflows can amplify request concurrency. By default, the shim limits
+concurrent upstream requests and retries transient upstream errors:
+
+```text
+GLM_SHIM_MAX_CONCURRENT=3
+GLM_SHIM_MAX_RETRIES=5
+GLM_SHIM_RETRY_BASE_MS=2000
+GLM_SHIM_UPSTREAM_TIMEOUT_MS=300000
+```
+
+Retryable upstream status codes:
+
+```text
+429, 500, 502, 503, 504
+```
+
+If BigModel returns rate-limit or temporary network errors, lower concurrency:
+
+```bash
+GLM_SHIM_MAX_CONCURRENT=2 ./run.sh
+```
+
 ## Model id and 1M context
 
 Use `glm-5.2` as the primary model id. You may use `glm-5.2[1M]` for

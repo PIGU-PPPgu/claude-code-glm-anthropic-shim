@@ -11,6 +11,13 @@ const DEFAULT_MODEL = process.env.GLM_MODEL || "glm-5.2";
 const LOG_DIR = process.env.GLM_SHIM_LOG_DIR || path.resolve("logs");
 const LOG_BODIES = process.env.GLM_SHIM_LOG_BODIES === "1";
 const THINKING_MODE = process.env.GLM_SHIM_THINKING || "enabled";
+const MAX_RETRIES = Number(process.env.GLM_SHIM_MAX_RETRIES || 5);
+const RETRY_BASE_MS = Number(process.env.GLM_SHIM_RETRY_BASE_MS || 2000);
+const MAX_CONCURRENT = Number(process.env.GLM_SHIM_MAX_CONCURRENT || 3);
+const UPSTREAM_TIMEOUT_MS = Number(process.env.GLM_SHIM_UPSTREAM_TIMEOUT_MS || 300000);
+
+let activeUpstreamRequests = 0;
+const upstreamQueue = [];
 
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
@@ -281,44 +288,145 @@ async function handleMessages(req, res) {
     upstreamBody: LOG_BODIES ? redact(upstreamBody) : undefined,
   });
 
-  const upstream = await fetch(UPSTREAM_URL, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(upstreamBody),
-  });
+  const releaseSlot = await acquireUpstreamSlot();
+  try {
+    const upstreamResult = await fetchUpstreamWithRetry(requestId, apiKey, upstreamBody);
+    const upstream = upstreamResult.response;
 
-  if (!upstream.ok) {
-    const text = await upstream.text();
-    await logJson(requestId, "upstream-error", {
-      status: upstream.status,
-      body: text.slice(0, 4000),
-    });
-    res.writeHead(upstream.status, JSON_HEADERS);
-    res.end(JSON.stringify({ type: "error", error: { message: text } }));
-    return;
+    try {
+      if (!upstream.ok) {
+        const text = await upstream.text();
+        await logJson(requestId, "upstream-error", {
+          status: upstream.status,
+          body: text.slice(0, 4000),
+        });
+        res.writeHead(upstream.status, JSON_HEADERS);
+        res.end(JSON.stringify({ type: "error", error: { message: text } }));
+        return;
+      }
+
+      if (body.stream) {
+        res.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        });
+        await streamOpenAIAsAnthropic(upstream, res, body.model || upstreamBody.model, requestId);
+        return;
+      }
+
+      const json = await upstream.json();
+      await logJson(requestId, "response", {
+        upstreamFinish: json.choices?.[0]?.finish_reason,
+        usage: json.usage,
+        body: LOG_BODIES ? redact(json) : undefined,
+      });
+      res.writeHead(200, JSON_HEADERS);
+      res.end(JSON.stringify(openAIToAnthropic(json, body.model || upstreamBody.model)));
+    } finally {
+      upstreamResult.cleanup();
+    }
+  } finally {
+    releaseSlot();
   }
+}
 
-  if (body.stream) {
-    res.writeHead(200, {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    });
-    await streamOpenAIAsAnthropic(upstream, res, body.model || upstreamBody.model, requestId);
-    return;
+async function fetchUpstreamWithRetry(requestId, apiKey, upstreamBody) {
+  const body = JSON.stringify(upstreamBody);
+  let lastResponse = null;
+  let lastError = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+    if (attempt > 0) {
+      const waitMs = retryDelayMs(attempt, lastResponse);
+      await logJson(requestId, "upstream-retry", {
+        attempt,
+        waitMs,
+        status: lastResponse?.status,
+        error: lastError?.message,
+      });
+      await sleep(waitMs);
+    }
+
+    let timeout = null;
+    try {
+      timeout = createUpstreamTimeout();
+      const response = await fetch(UPSTREAM_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${apiKey}`,
+        },
+        body,
+        signal: timeout.signal,
+      });
+      if (!isRetryableUpstreamStatus(response.status) || attempt === MAX_RETRIES) {
+        return { response, cleanup: timeout.cleanup };
+      }
+      lastResponse = response;
+      await response.text().catch(() => "");
+      timeout.cleanup();
+    } catch (error) {
+      timeout?.cleanup();
+      lastError = error;
+      if (attempt === MAX_RETRIES) throw error;
+    }
   }
+  throw lastError || new Error("Upstream request failed without a response");
+}
 
-  const json = await upstream.json();
-  await logJson(requestId, "response", {
-    upstreamFinish: json.choices?.[0]?.finish_reason,
-    usage: json.usage,
-    body: LOG_BODIES ? redact(json) : undefined,
-  });
-  res.writeHead(200, JSON_HEADERS);
-  res.end(JSON.stringify(openAIToAnthropic(json, body.model || upstreamBody.model)));
+function createUpstreamTimeout() {
+  if (!Number.isFinite(UPSTREAM_TIMEOUT_MS) || UPSTREAM_TIMEOUT_MS <= 0) {
+    return { signal: undefined, cleanup: () => {} };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`Upstream request timed out after ${UPSTREAM_TIMEOUT_MS} ms`));
+  }, UPSTREAM_TIMEOUT_MS);
+  return {
+    signal: controller.signal,
+    cleanup: () => clearTimeout(timer),
+  };
+}
+
+export function isRetryableUpstreamStatus(status) {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function retryDelayMs(attempt, response) {
+  const retryAfter = parseRetryAfterMs(response?.headers?.get?.("retry-after"));
+  if (retryAfter != null) return retryAfter;
+  const exponential = RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1);
+  const jitter = Math.floor(Math.random() * Math.min(500, RETRY_BASE_MS));
+  return exponential + jitter;
+}
+
+export function parseRetryAfterMs(value) {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const dateMs = Date.parse(value);
+  if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
+  return null;
+}
+
+async function acquireUpstreamSlot() {
+  if (!Number.isFinite(MAX_CONCURRENT) || MAX_CONCURRENT <= 0) return () => {};
+  if (activeUpstreamRequests >= MAX_CONCURRENT) {
+    await new Promise((resolve) => upstreamQueue.push(resolve));
+  }
+  activeUpstreamRequests += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeUpstreamRequests = Math.max(0, activeUpstreamRequests - 1);
+    const next = upstreamQueue.shift();
+    if (next) next();
+  };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function streamOpenAIAsAnthropic(upstream, res, requestedModel, requestId) {

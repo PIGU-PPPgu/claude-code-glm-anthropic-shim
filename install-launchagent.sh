@@ -39,6 +39,14 @@ cat > "$dst" <<PLIST
     <string>glm-5.2</string>
     <key>GLM_SHIM_THINKING</key>
     <string>enabled</string>
+    <key>GLM_SHIM_MAX_CONCURRENT</key>
+    <string>3</string>
+    <key>GLM_SHIM_MAX_RETRIES</key>
+    <string>5</string>
+    <key>GLM_SHIM_RETRY_BASE_MS</key>
+    <string>2000</string>
+    <key>GLM_SHIM_UPSTREAM_TIMEOUT_MS</key>
+    <string>300000</string>
     <key>GLM_SHIM_LOG_DIR</key>
     <string>${logs}/requests</string>
   </dict>

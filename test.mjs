@@ -1,9 +1,20 @@
 import assert from "node:assert/strict";
-import { anthropicToOpenAI, normalizeModel, openAIToAnthropic } from "./server.mjs";
+import {
+  anthropicToOpenAI,
+  isRetryableUpstreamStatus,
+  normalizeModel,
+  openAIToAnthropic,
+  parseRetryAfterMs,
+} from "./server.mjs";
 
 assert.equal(normalizeModel("glm-5.1[1M]"), "glm-5.1");
 assert.equal(normalizeModel("glm-5.2[1M]"), "glm-5.2");
 assert.equal(normalizeModel("claude-opus-4-6"), "glm-5.2");
+assert.equal(isRetryableUpstreamStatus(429), true);
+assert.equal(isRetryableUpstreamStatus(500), true);
+assert.equal(isRetryableUpstreamStatus(400), false);
+assert.equal(parseRetryAfterMs("2"), 2000);
+assert.equal(parseRetryAfterMs("bad"), null);
 
 const converted = anthropicToOpenAI({
   model: "glm-5.1[1M]",
